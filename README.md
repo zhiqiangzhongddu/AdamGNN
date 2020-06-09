@@ -18,15 +18,15 @@ All eight datasets we used in the paper are all public datasets which can be dow
 ### Code execution
 Link prediction:
 ```
-python main.py --task LP --dataset cora --mode basemodel --model AdaHGNN --layer_num 2 --epoch_num 201 --lr 0.0001 --relu True --dropout True --drop_ratio 0.5 --same_level_gnn GCN --down2up_gnn MEAN --up2down_gnn GAT --fshot False --SEED 123 --gpu True
+python main.py --task LP --dataset cora --mode basemodel --model AdaHGNN --num_levels 4 --num_epoch 2001 --lr 0.0001 --relu True --dropout True --drop_ratio 0.5 --local_agg_gnn GCN --fitness_mode both_c --pooling_mode att --loss_mode kl --SEED 123 --gpu True
 ```
 
 Node classification:
 ```
-python main.py --task NC --dataset cora --mode basemodel --model HCGNN --layer_num 2 --epoch_num 201 --lr 0.01 --relu True --dropout False --drop_ratio 0.5 --same_level_gnn GCN --down2up_gnn MEAN --up2down_gnn GCN --fshot True --SEED 123 --gpu True
+python main.py --task NC --dataset wiki --mode basemodel --model AdaHGNN --num_levels 5 --num_epoch 2001 --lr 0.0001 --relu True --dropout True --drop_ratio 0.1 --local_agg_gnn GCN --fitness_mode both_c --pooling_mode att --loss_mode all --SEED 123 --gpu True
 ``` 
 
 Graph classification:
 ```
-python main.py --task LP --dataset cora --mode basemodel --model AdaHGNN --layer_num 2 --epoch_num 201 --lr 0.0001 --relu True --dropout True --drop_ratio 0.5 --same_level_gnn GCN --down2up_gnn MEAN --up2down_gnn GAT --fshot False --SEED 123 --gpu True
+python main.py --task GC --dataset DD --mode basemodel --model AdaHGNN --num_levels 4 --num_epoch 2001 --lr 0.0001 --relu True --dropout True --drop_ratio 0.1 --local_agg_gnn GCN --fitness_mode both_c --pooling_mode att --loss_mode all --SEED 123 --gpu True
 ```

@@ -437,3 +437,314 @@ class Adaptive_pooling(nn.Module):
         
         return _embedding, _edge_matrix, _edge_matrix_weight, _edge_index, _edge_weight, B, cluster_ids, batch
 
+class AHGNN_LP(nn.Module):
+    def __init__(self, config, feat_dim):
+        super(AHGNN_LP, self).__init__()
+        self.config = config
+        self.feat_dim = feat_dim
+        self.agg_gnn = config['local_agg_gnn']
+        self.hid_dim = config['hid_dim']
+        self.num_levels = config['num_levels']
+        self.output_mode = config['output_mode']
+        
+        self.encoder = Encoder(feat_dim=self.feat_dim,
+                               hid_dim=self.hid_dim,
+                               agg_gnn=self.agg_gnn,
+                               gat_head=self.config['gat_head'], 
+                               drop_out=self.config['drop_ratio'],
+                               num_levels=self.num_levels)
+        
+        self.pools = nn.ModuleList()
+        for idx in range(self.num_levels):
+            self.pools.append(Adaptive_pooling(config=self.config,
+                                               in_size=self.hid_dim,
+                                               cluster_range=self.config['cluster_range'],
+                                               overlap=self.config['overlap'],
+                                               all_cluster=self.config['all_cluster'],
+                                               pooling_ratio=self.config['pooling_ratio']))
+        
+        self.out_cat = Merge_xs(config=self.config,
+                                mode=self.output_mode, 
+                                dim=self.hid_dim,
+                                num_levels=self.num_levels)
+        
+        self.last_gnn = GCNConv(self.hid_dim, self.hid_dim)
+    
+    def forward(self, data, epoch_id):
+        x, edge_index, edge_M, batch = data.x, data.train_pos_edge_index, data.edge_matrix, data.batch
+        
+        if x.shape[0] > edge_index.max().item():
+            edge_index = torch.cat((edge_index, torch.Tensor([[data.x.shape[0]-1], 
+                                                              [data.x.shape[0]-1]]).long().to(edge_index.device)), dim=-1)
+        edge_M = tg.utils.to_dense_adj(edge_index)[0]
+        edge_M_weight = edge_M.clone()
+        edge_weight = edge_M_weight[edge_M_weight>0]
+        
+        orig_edge_index = edge_index
+        orig_edge_weight = edge_weight
+
+        generated_embeddings = []
+        recover_matrices = []
+        As = []
+        weighted_As = []
+
+        for level in range(self.num_levels):
+            # gnn embedding
+            embedding, to_next = self.encoder(x, level, edge_index, edge_weight)
+            if level==0:
+                embedding_gnn = embedding.clone()
+#                 p = self.orig_gnn(x=embedding, edge_index=edge_index, edge_weight=edge_weight)
+            
+            # _X, _A, _A_w, _edge_index, _edge_weight, B, cluster_ids, batch
+            _input, _edge_M, _edge_M_weight, _edge_index, _edge_weight, recover_M, cluster_ids, batch = self.pools[level](embedding=to_next,
+                                                                                                                          edge_index=edge_index,
+                                                                                                                          edge_matrix=edge_M,
+                                                                                                                          edge_matrix_weight=edge_M_weight,
+                                                                                                                          edge_weight=edge_weight,
+                                                                                                                          batch=batch)
+            
+            _input = F.normalize(_input, p=2, dim=1)
+
+            if level>0:
+                for idx, recover in enumerate(reversed(recover_matrices)):
+                    embedding = torch.mm(recover, embedding)
+                    
+            generated_embeddings.append(embedding)
+            recover_matrices.append(recover_M)
+            As.append(edge_M)
+            weighted_As.append(edge_M_weight)
+
+            # assign the embedding as next level's input feature matrix
+            x = _input
+            edge_M = _edge_M
+            edge_M_weight = _edge_M_weight
+            edge_weight = _edge_weight
+            edge_index = _edge_index
+            
+            # feature normalization
+            x = x / x.sum(1, keepdim=True).clamp(min=1)
+        
+        embedding, scores = self.out_cat(data=data, xs=generated_embeddings)
+        
+        loss_kl = kl_loss(mu=embedding, logvar=embedding_gnn)
+        
+        embedding = self.last_gnn(x=embedding, 
+                                  edge_index=orig_edge_index, 
+                                  edge_weight=orig_edge_weight)
+        
+#         out = embedding
+        out = F.normalize(embedding, p=2, dim=-1)
+        
+        return out, loss_kl, recover_matrices, scores
+
+class AHGNN_NC(nn.Module):
+    def __init__(self, config, feat_dim, out_dim):
+        super(AHGNN_NC, self).__init__()
+        self.config = config
+        self.feat_dim = feat_dim
+        self.agg_gnn = config['local_agg_gnn']
+        self.hid_dim = config['hid_dim']
+        self.out_dim = out_dim
+        self.num_levels = config['num_levels']
+        self.output_mode = config['output_mode']
+        
+        self.encoder = Encoder(feat_dim=self.feat_dim,
+                               hid_dim=self.hid_dim,
+                               agg_gnn=self.agg_gnn,
+                               gat_head=self.config['gat_head'], 
+                               drop_out=self.config['drop_ratio'],
+                               num_levels=self.num_levels)
+        
+        self.pools = nn.ModuleList()
+        for level in range(self.num_levels):
+            self.pools.append(Adaptive_pooling(config=self.config,
+                                               in_size=self.hid_dim,
+                                               cluster_range=self.config['cluster_range'],
+                                               overlap=self.config['overlap'],
+                                               all_cluster=self.config['all_cluster'],
+                                               pooling_ratio=self.config['pooling_ratio']))
+        
+        self.out_cat = Merge_xs(config=self.config,
+                                mode=self.output_mode, 
+                                dim=self.hid_dim,
+                                num_levels=self.num_levels)
+        
+        self.last_gnn = GCNConv(self.hid_dim, self.out_dim)
+    
+    def forward(self, data, epoch_id):
+        x, edge_index, edge_M, batch = data.x, data.edge_index, data.edge_matrix, data.batch
+        edge_M_weight = edge_M.clone()
+        edge_weight = edge_M_weight[edge_M_weight>0]
+        
+        orig_edge_index = edge_index
+        orig_edge_weight = edge_weight
+
+        generated_embeddings = []
+        recover_matrices = []
+        As = []
+        weighted_As = []
+        fitness = []
+
+        for level in range(self.num_levels):
+            # gnn embedding
+            embedding, to_next = self.encoder(x, level, edge_index, edge_weight)
+
+            if level==0:
+                embedding_gnn = embedding.clone()
+            
+            # _X, _A, _A_w, _edge_index, _edge_weight, B, cluster_ids, batch
+            _input, _edge_M, _edge_M_weight, _edge_index, _edge_weight, recover_M, cluster_ids, batch, fit = self.pools[level](embedding=to_next,
+                                                                                                                          edge_index=edge_index,
+                                                                                                                          edge_matrix=edge_M,
+                                                                                                                          edge_matrix_weight=edge_M_weight,
+                                                                                                                          edge_weight=edge_weight,
+                                                                                                                          batch=batch)
+            
+            _input = F.normalize(_input, p=2, dim=1)
+
+            if level>0:
+                for idx, recover in enumerate(reversed(recover_matrices)):
+                    embedding = torch.mm(recover, embedding)
+            
+            generated_embeddings.append(embedding)
+            recover_matrices.append(recover_M)
+            As.append(edge_M)
+            weighted_As.append(edge_M_weight)
+            fitness.append(fit)
+
+            # assign the embedding as next level's input feature matrix
+            x = _input
+            edge_M = _edge_M
+            edge_M_weight = _edge_M_weight
+            edge_weight = _edge_weight
+            edge_index = _edge_index
+            
+        embedding, scores = self.out_cat(data=data, xs=generated_embeddings)
+        
+        loss_kl = kl_loss(mu=embedding, logvar=embedding_gnn)
+        loss_recon = recon_loss(z=embedding, pos_edge_index=orig_edge_index)
+        
+        embedding = self.last_gnn(x=embedding, 
+                                  edge_index=orig_edge_index, 
+                                  edge_weight=orig_edge_weight)
+        
+        out = F.log_softmax(embedding, dim=1)
+        
+        return out, loss_recon, loss_kl, recover_matrices, scores, fitness
+
+class AHGNN_GC(nn.Module):
+    def __init__(self, config, feat_dim, out_dim):
+        super(AHGNN_GC, self).__init__()
+        self.config = config
+        self.feat_dim = feat_dim
+        self.agg_gnn = config['local_agg_gnn']
+        self.hid_dim = config['hid_dim']
+        self.out_dim = out_dim
+        self.num_levels = config['num_levels']
+        self.output_mode = config['output_mode']
+        
+        self.encoder = Encoder(feat_dim=self.feat_dim,
+                               hid_dim=self.hid_dim,
+                               agg_gnn=self.agg_gnn,
+                               gat_head=self.config['gat_head'], 
+                               drop_out=self.config['drop_ratio'],
+                               num_levels=self.num_levels)
+        
+        self.pools = nn.ModuleList()
+        for idx in range(self.num_levels):
+            self.pools.append(Adaptive_pooling(config=self.config,
+                                               in_size=self.hid_dim,
+                                               cluster_range=self.config['cluster_range'],
+                                               overlap=self.config['overlap'],
+                                               all_cluster=self.config['all_cluster'],
+                                               pooling_ratio=self.config['pooling_ratio']))
+        
+        self.out_cat = Merge_xs(config=self.config,
+                                mode=self.output_mode, 
+                                dim=self.hid_dim,
+                                num_levels=self.num_levels)
+        
+        self.last_gnn = GCNConv(self.hid_dim, self.hid_dim)
+        
+        self.lin1 = torch.nn.Linear(2*self.hid_dim, self.hid_dim)
+        self.lin2 = torch.nn.Linear(self.hid_dim, self.hid_dim//2)
+        self.lin3 = torch.nn.Linear(self.hid_dim//2, self.out_dim)
+    
+    def forward(self, data, epoch_id):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        if x is None:
+            x = torch.zeros(edge_index.max().item()+1, 128).to(edge_index.device)
+        data.x = x
+        
+        if x.shape[0] > edge_index.max().item():
+            edge_index = torch.cat((data.edge_index, torch.Tensor([[data.x.shape[0]-1], 
+                                                                   [data.x.shape[0]-1]]).long().to(edge_index.device)), dim=-1)
+        
+        edge_M = tg.utils.to_dense_adj(edge_index)[0]
+        edge_M_weight = edge_M.clone()
+        edge_weight = edge_M_weight[edge_M_weight>0]
+        
+        orig_edge_index = edge_index
+        orig_edge_weight = edge_weight
+
+        generated_embeddings = []
+        recover_matrices = []
+        As = []
+        weighted_As = []
+
+        for level in range(self.num_levels):
+            # gnn embedding
+            embedding, to_next = self.encoder(x, level, edge_index, edge_weight)
+            if level==0:
+                embedding_gnn = embedding.clone()
+#                 p = self.orig_gnn(x=embedding, edge_index=edge_index, edge_weight=edge_weight)
+                x1 = torch.cat([gmp(embedding_gnn, batch), gap(embedding_gnn, batch)], dim=1)
+            
+            # _X, _A, _A_w, _edge_index, _edge_weight, B, cluster_ids, batch
+            _input, _edge_M, _edge_M_weight, _edge_index, _edge_weight, recover_M, cluster_ids, batch = self.pools[level](embedding=to_next,
+                                                                                                                          edge_index=edge_index,
+                                                                                                                          edge_matrix=edge_M,
+                                                                                                                          edge_matrix_weight=edge_M_weight,
+                                                                                                                          edge_weight=edge_weight,
+                                                                                                                          batch=batch)
+            
+            _input = F.normalize(_input, p=2, dim=1)
+
+            if level>0:
+                for idx, recover in enumerate(reversed(recover_matrices)):
+                    embedding = torch.mm(recover, embedding)
+
+            generated_embeddings.append(embedding)
+            recover_matrices.append(recover_M)
+            As.append(edge_M)
+            weighted_As.append(edge_M_weight)
+
+            # assign the embedding as next level's input feature matrix
+            x = _input
+            edge_M = _edge_M
+            edge_M_weight = _edge_M_weight
+            edge_weight = _edge_weight
+            edge_index = _edge_index
+        
+#         embedding, scores = self.out_cat(data=data, xs=generated_embeddings)
+#         x2 = torch.cat([gmp(embedding, batch), gap(embedding, batch)], dim=1)
+        
+#         loss_kl = kl_loss(mu=embedding, logvar=embedding_gnn)
+#         loss_recon = recon_loss(z=embedding, pos_edge_index=orig_edge_index)
+        
+        embedding = self.last_gnn(x=embedding, 
+                                  edge_index=orig_edge_index, 
+                                  edge_weight=orig_edge_weight)
+        x3 = torch.cat([gmp(embedding, batch), gap(embedding, batch)], dim=1)
+        
+#         x = F.relu(x1) + F.relu(x2) + F.relu(x3)
+        x = F.relu(x1) + F.relu(x3)
+        x = F.relu(self.lin1(x))
+        x = F.dropout(x, p=self.config['drop_ratio'], training=self.training)
+        x = F.relu(self.lin2(x))
+        x = F.dropout(x, p=self.config['drop_ratio'], training=self.training)
+        
+        out = F.log_softmax(x, dim=1)
+        
+#         return out, loss_recon, loss_kl, recover_matrices, scores
+        return out, torch.Tensor([0]).to(device), torch.Tensor([0]).to(device), torch.Tensor([0]).to(device), torch.Tensor([0]).to(device)
