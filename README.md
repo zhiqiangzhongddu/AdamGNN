@@ -1,4 +1,4 @@
-# Adaptive HIerarchical Graph Neural Network
+# Adaptive Hierarchical Graph Neural Network
 
 Implementation of the AdaHGNN with Pytorch, another implementation with Tensorflow incoming.
 
