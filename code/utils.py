@@ -11,10 +11,10 @@ from scipy.optimize import linear_sum_assignment as linear
 from sklearn import metrics
 
 import torch
-from torch import nn
 import torch.nn.functional as F
 import torch_geometric as tg
 from torch_geometric.utils import add_remaining_self_loops, to_undirected
+
 
 def generate_bigram(ls):
     res = []
@@ -22,15 +22,22 @@ def generate_bigram(ls):
         res += [(ls[i], item) for item in ls[i+1:]]
     return res
 
+
 def max_lists(lists):
     return max([item for items in lists for item in items])
+
+
 def min_lists(lists):
     return min([item for items in lists for item in items])
 
+
 def max_node(G):
     return max(G)
+
+
 def min_node(G):
     return min(G)
+
 
 def top_k_prediction(preds, labels):
     preds = preds.data.cpu().numpy()
@@ -39,6 +46,7 @@ def top_k_prediction(preds, labels):
         preds_tmp[preds[idx].argsort()[-sum(item):]] = 1
         preds[idx] = preds_tmp
     return preds
+
 
 def fill_diagonal(A, value, device):
     _A = A.clone()
@@ -63,6 +71,8 @@ def fill_diagonal(A, value, device):
 
 #     dist = x_norm + y_norm - 2.0 * torch.mm(x, y.t())
 #     return dist
+
+
 def euclidean_dist(x, y):
     """
     Args:
@@ -78,15 +88,17 @@ def euclidean_dist(x, y):
     # yy会在最后进行转置的操作
     yy = torch.pow(y, 2).sum(1, keepdim=True).expand(n, m).t()
     dist = xx + yy
-    # torch.addmm(beta=1, input, alpha=1, mat1, mat2, out=None)，这行表示的意思是dist - 2 * x * yT 
+    # torch.addmm(beta=1, input, alpha=1, mat1, mat2, out=None)，这行表示的意思是dist - 2 * x * yT
     dist.addmm_(1, -2, x, y.t())
     # clamp()函数可以限定dist内元素的最大最小范围，dist最后开方，得到样本之间的距离矩阵
     dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
     return dist
 
+
 def non_zero_mean(A):
     res = A.sum() / torch.nonzero(A).size(0)
     return res.data
+
 
 def sparse_softmax(M, dim):
     """
@@ -109,39 +121,39 @@ def sparse_softmax(M, dim):
     return out
 
 
-# # not usable for GC
-# def attention(query, message, lin_att, normalize, drop_ratio, training):
-#     if normalize:
-#         query = F.normalize(query, p=2, dim=-1)
-#         message = F.normalize(message, p=2, dim=-1)
-
-#     # calculate attention score
-#     score = lin_att(torch.cat((message, query), dim=-1)).squeeze(-1)
-#     score = F.leaky_relu(score)
-
-#     score = F.softmax(score)
-    
-#     # Sample attention coefficients stochastically.
-#     score = F.dropout(score, p=drop_ratio, training=training)
-
-#     return score.unsqueeze(-1)
-
-# usable for GC
+# not usable for GC
 def attention(query, message, lin_att, normalize, drop_ratio, training):
     if normalize:
         query = F.normalize(query, p=2, dim=-1)
         message = F.normalize(message, p=2, dim=-1)
 
     # calculate attention score
-    score = lin_att(torch.cat((message, query), dim=-1))
+    score = lin_att(torch.cat((message, query), dim=-1)).squeeze(-1)
     score = F.leaky_relu(score)
 
     score = F.softmax(score)
-    
+
     # Sample attention coefficients stochastically.
     score = F.dropout(score, p=drop_ratio, training=training)
 
-    return score
+    return score.unsqueeze(-1)
+
+# # usable for GC
+# def attention(query, message, lin_att, normalize, drop_ratio, training):
+#     if normalize:
+#         query = F.normalize(query, p=2, dim=-1)
+#         message = F.normalize(message, p=2, dim=-1)
+
+#     # calculate attention score
+#     score = lin_att(torch.cat((message, query), dim=-1))
+#     score = F.leaky_relu(score)
+
+#     score = F.softmax(score)
+
+#     # Sample attention coefficients stochastically.
+#     score = F.dropout(score, p=drop_ratio, training=training)
+
+#     return score
 
 
 def sparse_attention(query, message, query_M, lin_att, normalize, drop_ratio, training):
@@ -157,7 +169,7 @@ def sparse_attention(query, message, query_M, lin_att, normalize, drop_ratio, tr
     score = F.dropout(score, p=drop_ratio, training=training)
     score = sparse_softmax(M=score, dim=0)
     score = score.sum(-1).view(-1, 1)
-    
+
     return score
 
 
@@ -165,11 +177,11 @@ def gating_sum(orig, received, lin_1, lin_2, normalize, drop_ratio, training):
     if normalize:
         orig = F.normalize(orig, p=2, dim=-1)
         received = F.normalize(received, p=2, dim=-1)
-    
+
     gat_score = F.sigmoid(lin_1(orig) + lin_2(received))
     gat_score = F.dropout(gat_score, p=drop_ratio, training=training)
     out = torch.mul(gat_score, orig) + torch.mul((1-gat_score), orig)
-    
+
     return out
 
 
@@ -189,6 +201,7 @@ def smooth_filter(laplacian_matrix, lda=0.1):
     norm_adj = degree @ adj_matrix @ degree
     return norm_adj
 
+
 def adj2norm_adj(matrix):
     device = matrix.device
 
@@ -198,6 +211,7 @@ def adj2norm_adj(matrix):
     norm_adj = torch.FloatTensor(smooth_filter(laplacian_matrix=laplacian).toarray()).to(device)
 
     return norm_adj
+
 
 def generate_top_down_graph(embeddings):
     num_nodes = embeddings[0].shape[0]
@@ -212,17 +226,17 @@ def generate_top_down_graph(embeddings):
             # idx_2 += [i+num_nodes*(j+1), i]
         # idx_1 += [i]
         # idx_2 += [i]
-            
+
     edge_index = torch.Tensor([idx_1, idx_2]).long().to(device)
     # edge_index = torch.Tensor([idx_2]).long().to(device)
     # edge_index, _ = add_remaining_self_loops(edge_index=edge_index, edge_weight=None)
-    
+
     return edge_index
 
 # def generate_top_down_graph(embeddings):
 #     num_nodes = embeddings[0].shape[0]
 #     device = embeddings[0].device
-    
+
 #     idx_1, idx_2 = [], []
 #     for i in range(num_nodes):
 #         candidates = [i]
@@ -233,10 +247,10 @@ def generate_top_down_graph(embeddings):
 #         # idx_2 += [item[1] for item in pairs]
 #         idx_1 += [item[1] for item in pairs]
 #         idx_2 += [item[0] for item in pairs]
-    
+
 #     edge_index = torch.Tensor([idx_1, idx_2]).long().to(device)
 #     edge_index, _ = add_remaining_self_loops(edge_index=edge_index, edge_weight=None)
-    
+
 #     return edge_index
 
 
@@ -276,18 +290,19 @@ def kl_loss(mu, logvar):
         logvar (Tensor, optional): The latent space for
             :math:`\log\sigma^2`.
     """
-    
+
     loss = -0.5 * torch.mean(torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=1))
     loss = (1 / mu.shape[0]) * loss
 
     return loss
+
 
 def target_distribution(q):
     weight = q**2 / q.sum(0)
     return (weight.t() / weight.sum(1)).t()
 
 
-def train_test_split_edges(data, val_ratio, test_ratio, SEED):
+def train_test_split_edges(data, val_ratio, test_ratio, seed):
     r"""Splits the edges of a :obj:`torch_geometric.data.Data` object
     into positive and negative train/val/test edges, and adds attributes of
     `train_pos_edge_index`, `train_neg_adj_mask`, `val_pos_edge_index`,
@@ -303,9 +318,9 @@ def train_test_split_edges(data, val_ratio, test_ratio, SEED):
 
     :rtype: :class:`torch_geometric.data.Data`
     """
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     assert 'batch' not in data  # No batch-mode.
 
@@ -422,3 +437,25 @@ def eva(y_true, y_pred, epoch=0):
             ', f1 {:.4f}'.format(f1))
     print('\n')
 
+
+def weights_init(m):
+    if isinstance(m, torch.nn.Linear):
+        m.weight.data = torch.nn.init.uniform_(m.weight.data)
+        # m.weight.data = torch.nn.init.xavier_uniform_(m.weight.data, gain=torch.nn.init.calculate_gain('relu'))
+        # m.weight.data = torch.nn.init.kaiming_uniform_(m.weight.data, nonlinearity='relu')
+        # pass
+
+
+def seed_everything(seed: int):
+    import random
+    import os
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    os.environ['PYTHONHASHseed'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True

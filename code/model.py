@@ -1,750 +1,461 @@
-import pandas as pd
-import numpy as np
-import random
-import networkx as nx
-import time
-from copy import deepcopy
-from sys import platform
-from sklearn import preprocessing
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, normalized_mutual_info_score
-from load_dataset import *
-from set_up_training import *
-from utils import *
-import sys
-
 import torch
 from torch import nn
-from torch.nn.parameter import Parameter
 import torch.nn.functional as F
-from tensorboardX import SummaryWriter
-
 import torch_geometric as tg
-from torch_geometric.nn import GCNConv, SAGEConv, GATConv, GINConv, JumpingKnowledge
-from torch_geometric.nn.pool.topk_pool import topk
+from torch_geometric.nn import GCNConv, SAGEConv, GATConv, JumpingKnowledge, GAE, InnerProductDecoder
+from torch_scatter import scatter
+from torch_sparse import coalesce
+from torch_sparse import transpose
+from torch_sparse import spspmm
+
+from utils import kl_loss, recon_loss
 
 import warnings
+
 warnings.filterwarnings('ignore')
+
+
 # %matplotlib inline
 
 
-def Generate_high_order_adjacency_matrix(A, order):
-    As = [A]
-    for _ in range(order-1):
-        _A = torch.mm(A, A)
-        _A = fill_diagonal(A=_A, value=0, device=_A.device)
-        _A = (_A > 0.5).float() * 1
-        for a in As:
-            _A = _A - a
-        A = _A
-        A[A < 0] = 0
-        As.append(A)
-    return A
+def StAS(index_A, value_A, index_S, value_S, device, N, kN):
+    r"""StAS: a function which returns new edge weights for the pooled graph using the formula S^{T}AS"""
 
-def Generate_clusters(matrix, edge_score, cluster_range, threshold):
-    matrix = fill_diagonal(A=matrix, value=0, device=matrix.device)
-    matrix[torch.where(edge_score < threshold)] = 0
-    
-    cluster_matrices = []
-    for order in range(1, cluster_range+1):
-        cluster_matrices.append(Generate_high_order_adjacency_matrix(A=matrix, order=order))
-    
-    return cluster_matrices
+    index_A, value_A = coalesce(index_A, value_A, m=N, n=N)
+    index_S, value_S = coalesce(index_S, value_S, m=N, n=kN)
+    index_B, value_B = spspmm(index_A, value_A, index_S, value_S, N, N, kN)
 
-class Cluster_assignment(nn.Module):
-    def __init__(self, cluster_range, device):
-        super(Cluster_assignment, self).__init__()
-        self.cluster_range = cluster_range
-        self.device = device
-        
-    def forward(self, fitness, cluster_matrices):
-        # input: fitness, cluster_matrix, cluster_matrices
-        # output: cluster fitness
-        cluster_fitness = []
-        for matrix in cluster_matrices:
-            # make sure scores are positive
-            matrix_fitness = torch.mul(fitness, matrix)
-            scores = matrix_fitness.sum(-1) / matrix.sum(-1) # cluster mean scores without weight
-            scores[scores != scores] = 0 # we need it: 
-#             scores[scores != scores] = 1 # we need it: 
-            cluster_fitness.append(scores)
-        
-        cluster_scores = torch.stack(cluster_fitness).sum(0) / self.cluster_range # n*1
-        
-#         # set isolated node's score as 0
-#         isolated_nodes = [cluster_matrix.sum(dim=1) == 0] # ???
-#         cluster_scores[isolated_nodes[0]] = 0 # ???
-        
-        return cluster_scores
+    index_St, value_St = transpose(index_S, value_S, N, kN)
+    index_B, value_B = coalesce(index_B, value_B, m=N, n=kN)
+    index_E, value_E = spspmm(index_St, value_St, index_B, value_B, kN, N, kN)
 
-def Select_clusters(config, fitness, edge_matrix, cluster_matrix, cluster_matrices, cluster_scores, pooling_ratio, cluster_range, pick_all, overlap):
-    # input: cluster_matrix, cluster_scores, pooling_ratio
-    # output: cluster_fitness
-    num_nodes = cluster_matrix.shape[0]
+    return index_E, value_E
+
+
+def graph_connectivity(x, cluster_ids, edge_index, edge_weight, cluster_index, score, N, do_view, device):
+    r"""graph_connectivity: is a function which internally calls StAS func to maintain graph connectivity"""
+
+    # nodes included in pooled ego networks
+    mask_in = (cluster_index[1].unsqueeze(-1) == cluster_ids).any(-1).nonzero().squeeze()
+    index_in = cluster_index[:, mask_in]
+    value_in = score[mask_in]
+    # nodes do not included in any pooled ego networks, we treat them as nodes in pooled graph
+    # Complement set operation
+    # non_in = cluster_index.unique()[((cluster_index.unique().unsqueeze(-1)==index_in.unique()).sum(-1)==0)]
+    # non_in = torch.LongTensor(list(set(cluster_index.unique().tolist())-set(index_in.unique().tolist()))).to(device)
+    # non_in = torch.LongTensor(list(set(edge_index.unique().tolist())-set(index_in.unique().tolist()))).to(device)
+    non_in = torch.LongTensor(list(set(range(N)) - set(index_in.unique().tolist()))).to(device)
+    # creat the S
+    index_S = torch.cat(
+        [index_in, torch.stack([cluster_ids, cluster_ids], axis=0), torch.stack([non_in, non_in], axis=0)], axis=-1)
+    value_S = F.pad(input=value_in, pad=(0, index_S.shape[1] - value_in.shape[0]), mode='constant', value=1.)
+    # # sort
+    # _, indices = torch.sort(index_S, 1)
+    # index_S = index_S[:, indices[1]]
+    # value_S = value_S[indices[1]]
+
+    # calculate the number of nodes in the pooled graph
+    kN = index_S[1].unique().size(0)
+    # update cluster_ids with remaining nodes
+    ego_ids = index_S[1].unique()
+    if do_view:
+        print(f'Origin graph has {N} nodes, {N - cluster_index.unique().size(0)} isolated nodes')
+        print(f'Pooled graph has {kN} nodes, {cluster_ids.size(0)} ego nodes, {non_in.size(0)} remaining nodes')
+
+    # relabel for pooling ie: make S [N x kN]
+    n_idx = torch.zeros(N, dtype=torch.long)
+    n_idx[ego_ids] = torch.arange(ego_ids.size(0))
+    index_S[1] = n_idx[index_S[1]]
+
+    # generate ego feature
+    ego_x = x[ego_ids]
+
+    # create A
+    index_A = edge_index.clone()
+    if edge_weight is None:
+        value_A = value_S.new_ones(edge_index[0].size(0))
+    else:
+        value_A = edge_weight.clone()
+
+    index_E, value_E = StAS(index_A, value_A, index_S, value_S, device, N, kN)
+    index_E, value_E = tg.utils.add_remaining_self_loops(edge_index=index_E, edge_weight=value_E, fill_value=1.)
+
+    return index_E, value_E, index_S, value_S, ego_x
+
+
+def Generate_high_order_adj(edge_index, order, M):
+    res_index = edge_index.clone()
+
+    for _ in range(order - 1):
+        res_index, _ = spspmm(res_index, None, edge_index, None, M, M, M, coalesced=True)
+
+    return res_index
+
+
+def Generate_clusters(edge_index, num_hops):
+    M = edge_index[0].max().item() + 1
+    # edge_index, _ = tg.utils.remove_self_loops(edge_index=edge_index)
+
+    # For directed graph
+    ls_index = [edge_index]
+    for order in range(2, num_hops + 1):
+        ls_index.append(Generate_high_order_adj(
+            edge_index=edge_index,
+            order=order,
+            M=M
+        ))
+    cluster_index = torch.cat(ls_index, axis=-1)
+    cluster_index = cluster_index.unique(dim=-1)
+    # # For undirected graph
+    # cluster_index = Generate_high_order_adj(
+    #     edge_index=edge_index,
+    #     order=num_hops,
+    #     M=M
+    # )
+    cluster_index, _ = tg.utils.remove_self_loops(edge_index=cluster_index)
+    return cluster_index
+
+
+def Cluster_assignment(fitness, index):
+    out = scatter(fitness, index[1], dim=0, reduce='mean')
+    return out
+
+
+def Select_clusters(edge_index, scores, range, overlap, N, device):
     if overlap:
-        _cluster_matrix = cluster_matrices[0]
-        local_extrema = (cluster_scores.expand(num_nodes, num_nodes)).t()\
-                            - torch.mul(_cluster_matrix, cluster_scores.expand(num_nodes, num_nodes)) > 0
+        index, _ = tg.utils.remove_self_loops(edge_index=edge_index)
+        all_idx = index[0].unique()
+        del_idx = index[0][(scores[index[0]] - scores[index[1]]) < 0].unique()
+        # Complement set operation
+        # cluster_ids = all_idx[((all_idx.unsqueeze(-1)==del_idx).sum(-1)==0)]
+        cluster_ids = torch.LongTensor(list(set(all_idx.tolist()) - set(del_idx.tolist()))).to(device)
     else:
-        cluster_matrices = Generate_clusters(matrix=edge_matrix,
-                                             edge_score=fitness, 
-                                             cluster_range=cluster_range*2,
-                                             threshold=config['edge_threshold'])
-        # represent clusters within one matrix 
-        _cluster_matrix = torch.stack(cluster_matrices).sum(0)
-        _cluster_matrix = (_cluster_matrix > 0.5).float().to(_cluster_matrix.device)
-        local_extrema = (cluster_scores.expand(num_nodes, num_nodes)).t()\
-                            - torch.mul(_cluster_matrix, cluster_scores.expand(num_nodes, num_nodes)) > 0
-    
-    if pick_all:
-        # pick up all clusters
-        cluster_ids = torch.tensor(torch.nonzero(local_extrema.sum(-1)==num_nodes).view(-1))
-    else:
-        # select top-k clusters
-        candicate_clusters = torch.tensor(torch.nonzero(local_extrema.sum(-1)==num_nodes).view(-1))
-        if candicate_clusters.shape[0] < num_nodes*pooling_ratio:
-            cluster_ids = candicate_clusters
-        else:
-            candicate_cluster_fitness = cluster_scores[candicate_clusters]
-            idx_ = topk(x=candicate_cluster_fitness, 
-                        ratio=(num_nodes*pooling_ratio/candicate_clusters.shape[0]), 
-                        batch=torch.tensor([0]*candicate_clusters.shape[0]).to(candicate_cluster_fitness.device)) # 
-            cluster_ids = candicate_clusters[idx_]
-    
+        index = Generate_clusters(edge_index=edge_index,
+                                  num_hops=range * 2)
+        all_idx = index[0].unique()
+        del_idx = index[0][(scores[index[0]] - scores[index[1]]) < 0].unique()
+        # Complement set operation
+        # cluster_ids = all_idx[((all_idx.unsqueeze(-1)==del_idx).sum(-1)==0)]
+        cluster_ids = torch.LongTensor(list(set(all_idx.tolist()) - set(del_idx.tolist()))).to(device)
     return cluster_ids
 
-def Generate_assignment_matrix(cluster_matrix, cluster_ids, fitness, do_view):
-    # input: cluster_matrix, cluster_idx
-    # output: S, B
-    num_nodes = cluster_matrix.shape[0]
-    S = cluster_matrix.clone()
-    S_fitness = torch.mul(cluster_matrix, fitness)
-    
-    reduced_nodes = torch.nonzero(S[:, cluster_ids].sum(-1)>0).view(-1).to(cluster_ids.device)
-    # remove isolated nodes
-    isolated_nodes = torch.nonzero(S.sum(0)==0).view(-1).to(cluster_ids.device)
-    reduced_nodes = torch.cat([isolated_nodes, reduced_nodes])
-    keeping_nodes = torch.tensor(list(set(range(num_nodes))-\
-                                      set(cluster_ids.tolist())-\
-                                      set(reduced_nodes.tolist()))).to(cluster_ids.device)
-    
-    if do_view:
-        print('total: {}, next: {}, cluster: {}, isolated: {}, reduced: {}, keeping: {}.'.format(num_nodes, 
-                                                                                                 len(cluster_ids)+len(keeping_nodes),
-                                                                                                 len(cluster_ids),
-                                                                                                 len(isolated_nodes),
-                                                                                                 len(reduced_nodes),
-                                                                                                 len(keeping_nodes)))
-    
-    if keeping_nodes.shape[0]>0:
-        S[:, keeping_nodes]=0
-        S_fitness[:, keeping_nodes]=0
-    
-    _S_ = torch.eye(n=S.shape[0], m=S.shape[1]).to(S.device)
-    _S_ = _S_[:, list(set(range(num_nodes))-set(reduced_nodes.tolist()))]
-    
-    S_orig = S.clone()
-    S = fill_diagonal(A=S, value=1, device=S.device)
-    S = S[:, list(set(range(num_nodes))-set(reduced_nodes.tolist()))]
-    
-    S_fitness_orig = S_fitness.clone()
-    S_fitness = fill_diagonal(A=S_fitness, value=1, device=S_fitness.device)
-    S_fitness = S_fitness[:, list(set(range(num_nodes))-set(reduced_nodes.tolist()))]
-    
-    return S, S_orig, S_fitness, S_fitness_orig, keeping_nodes, _S_
 
 class Merge_xs(nn.Module):
-    def __init__(self, config, mode, dim, num_levels):
+    def __init__(self, args, mode, dim, num_levels):
         super(Merge_xs, self).__init__()
-        self.config=config
-        self.mode=mode
-        self.dim=dim
-        self.num_levels=num_levels
-        
-        if self.mode=='LINEAR':
-            self.out_cat = JumpingKnowledge(mode='cat', channels=self.dim, num_layers=self.num_levels)
-            self.lin_top_down = nn.Linear(self.dim*self.num_levels, self.dim)
-        elif self.mode=='MAX':
-            self.out_cat = JumpingKnowledge(mode='max', channels=self.dim, num_layers=self.num_levels)
-        elif self.mode=='LSTM':
-            self.out_cat = JumpingKnowledge(mode='lstm', channels=self.dim, num_layers=self.num_levels)
-        elif self.mode=='GCN':
-            self.out_cat = GCNConv(self.dim, self.dim)
-            self.out_cat_2 = GCNConv(self.dim, self.dim)
-        elif self.mode=='GAT':
-            self.out_cat = GATConv(self.dim, 8, heads=8)
-            self.out_cat_2 = GATConv(8*8, self.dim, heads=1)
-        
-        self.lin_1 = nn.Linear(self.dim, self.dim)
-        self.lin_2 = nn.Linear(self.dim, self.dim)
-        if self.mode=='ATT':
-            self.gat_atts = nn.ModuleList()
-            for _ in range(self.num_levels-1):
-                self.gat_atts.append(nn.Linear(2*self.dim, 1))
-            
-    def forward(self, data, xs):
-        generated_embeddings = xs
-        scores = []
-        
-        if self.mode=='NONE':
-            embedding = generated_embeddings[0]
-        elif self.mode=='MEAN':
+        self.args = args
+        self.mode = mode
+        self.dim = dim
+        self.num_levels = num_levels
+        self.drop_ratio = args.drop_ratio
+        self.device = args.device
+
+        if self.num_levels > 1:
+            if self.mode == 'MAX':
+                self.out_cat = JumpingKnowledge(mode='max', channels=self.dim, num_layers=self.num_levels)
+            elif self.mode == 'LSTM':
+                self.out_cat = JumpingKnowledge(mode='lstm', channels=self.dim, num_layers=self.num_levels)
+            elif self.mode == 'ATT':
+                self.lin_att = nn.Linear(2 * self.dim, 1)
+
+    def forward(self, xs):
+        score = None
+
+        if self.mode == 'NONE':
+            embedding = xs[0]
+        elif self.mode == 'MEAN':
             # mean
-            embedding = torch.mean(torch.stack(generated_embeddings), dim=0)
-        elif self.mode=='GAT':
-            all_embeddings = torch.cat(generated_embeddings, dim=0)
-            # all_embeddings[0:generated_embeddings[0].shape[0],:] = 0
-            top_down_edge_index = generate_top_down_graph(embeddings=generated_embeddings)
-            # entire final aggregation
-            edge_index = data.edge_index # with within level
-            edge_index = torch.cat((edge_index, top_down_edge_index), dim=-1)
-            # edge_index = top_down_edge_index # without within level
-            # edge_index, _ = tg.utils.remove_self_loops(edge_index=edge_index, edge_attr=None)
-            # edge_index, _ = tg.utils.add_remaining_self_loops(edge_index=edge_index, edge_weight=None)
-            all_embeddings = self.out_cat(x=all_embeddings, edge_index=edge_index)
-            all_embeddings = F.relu(all_embeddings)
-            # all_embeddings = F.dropout(all_embeddings, p=self.config['drop_ratio'], training=self.training)
-            all_embeddings = self.out_cat_2(x=all_embeddings, edge_index=edge_index)
-            # all_embeddings = F.relu(all_embeddings)
-            
-            # embedding = all_embeddings[0:generated_embeddings[0].shape[0],:]
-            embedding = gating_sum(orig=xs[0], 
-                                    received=all_embeddings[0:xs[0].shape[0], :], 
-                                    lin_1=self.lin_1, 
-                                    lin_2=self.lin_2, 
-                                    normalize=True,
-                                    drop_ratio=self.config['drop_ratio'], 
-                                    training=self.training)
-        
-        elif self.mode=='LINEAR':
+            embedding = torch.mean(torch.stack(xs), dim=0)
+        elif self.mode == 'LINEAR':
             # linear transfer
-            embedding = self.out_cat(xs=generated_embeddings)
+            embedding = self.out_cat(xs=xs)
             embedding = self.lin_top_down(embedding)
-        
-        elif self.mode=='ATT':
-            query = generated_embeddings[0]
-            messages = generated_embeddings[1:]
-            for idx, m in enumerate(messages):
-                score = attention(query=query,
-                                    message=m,
-                                    lin_att=self.gat_atts[idx],
-                                    normalize=True,
-                                    drop_ratio=self.config['drop_ratio'],
-                                    training=self.training)
-                messages[idx] = m * score
-                scores.append(score)
-                
-            embedding = torch.sum(torch.stack([query]+messages), dim=0)
-        
-        elif self.mode=='GATING':
-            query = generated_embeddings[0]
-            messages = generated_embeddings[1:]
-            for idx, m in enumerate(messages):
-                score = attention(query=query,
-                                    message=m,
-                                    lin_att=self.gat_atts[idx],
-                                    normalize=True,
-                                    drop_ratio=self.config['drop_ratio'],
-                                    training=self.training)
-                messages[idx] = m * score
-            
-            # or above will get overfitting? train accuracy --> 1.0
-            message = torch.sum(torch.stack(messages), dim=0)
-            message = torch.mean(torch.stack(messages), dim=0)
-            embedding = gating_sum(orig=query, 
-                                    received=message, 
-                                    lin_1=self.lin_1, 
-                                    lin_2=self.lin_2, 
-                                    normalize=True,
-                                    drop_ratio=self.config['drop_ratio'], 
-                                    training=self.training)
-
+        elif self.mode == 'ATT':
+            query = xs[0]
+            message = torch.cat(xs[1:], axis=0)
+            N = query.shape[0]
+            # normalize inputs
+            query = F.normalize(query, p=2, dim=-1)
+            message = F.normalize(message, p=2, dim=-1)
+            score = self.lin_att(torch.cat((message, query.repeat(self.num_levels - 1, 1)), dim=-1)).squeeze(-1)
+            score = F.leaky_relu(score, inplace=False)
+            # sparse softmax
+            index = torch.LongTensor(
+                [list(range(N, N * (self.num_levels))), list(range(N)) * (self.num_levels - 1)]
+            ).to(self.device)
+            score = tg.utils.softmax(score, index[1], num_nodes=N * self.num_levels)
+            # Sample attention coefficients stochastically.
+            score = F.dropout(score, p=self.drop_ratio, training=self.training)
+            # add weight to message
+            message = score.unsqueeze(-1) * message
+            # obtain final embedding
+            embedding = query + scatter(message, index[1], dim=0, reduce='add')
         else:
-            embedding = self.out_cat(xs=generated_embeddings)
+            embedding = self.out_cat(xs=xs)
 
-        return embedding, scores
+        return embedding, score
+
 
 class Encoder(nn.Module):
-    def __init__(self, feat_dim, hid_dim, agg_gnn, gat_head, drop_out, num_levels):
+    def __init__(self, feat_dim, hid_dim, agg_gnn, drop_ratio, num_levels, encoder_layers):
         super(Encoder, self).__init__()
         self.feat_dim = feat_dim
         self.hid_dim = hid_dim
         self.agg_gnn = agg_gnn
-        self.gat_head = gat_head
-        self.drop_out = drop_out
+        self.drop_ratio = drop_ratio
         self.num_levels = num_levels
-        
+        self.encoder_layers = encoder_layers
+
         self.convs = nn.ModuleList()
         for level in range(self.num_levels):
-            if level==0:
-                if self.agg_gnn != 'GAT':
-                    self.convs.append(GCNConv(self.feat_dim, self.hid_dim))
+            level_convs = nn.ModuleList()
+            for layer in range(self.encoder_layers):
+                if (level == 0) & (layer == 0):
+                    if self.agg_gnn == 'GCN':
+                        level_convs.append(GCNConv(self.feat_dim, self.hid_dim))
+                    elif self.agg_gnn == 'SAGE':
+                        level_convs.append(SAGEConv(self.feat_dim, self.hid_dim))
+                    elif self.agg_gnn == 'GAT':
+                        level_convs.append(GATConv(
+                            self.feat_dim, self.hid_dim // 8,
+                            heads=8, dropout=self.drop_ratio
+                        ))
                 else:
-                    self.convs.append(GATConv(in_channels=self.feat_dim, 
-                                                out_channels=(self.hid_dim//self.gat_head), 
-                                                heads=self.gat_head,
-                                                dropout=self.drop_out))
-            else:
-                if self.agg_gnn != 'GAT':
-                    self.convs.append(GCNConv(self.hid_dim, self.hid_dim))
-                else:
-                    self.convs.append(GATConv(in_channels=self.hid_dim, 
-                                                out_channels=(self.hid_dim//self.gat_head), 
-                                                heads=self.gat_head,
-                                                dropout=self.drop_out))
-    
+                    if self.agg_gnn == 'GCN':
+                        level_convs.append(GCNConv(self.hid_dim, self.hid_dim))
+                    elif self.agg_gnn == 'SAGE':
+                        level_convs.append(SAGEConv(self.hid_dim, self.hid_dim))
+                    elif self.agg_gnn == 'GAT':
+                        level_convs.append(GATConv(
+                            self.hid_dim, self.hid_dim // 8,
+                            heads=8, dropout=self.drop_ratio
+                        ))
+            self.convs.append(level_convs)
+
     def forward(self, x, level, edge_index, edge_weight):
-        if self.agg_gnn != 'GAT':
-            embedding = self.convs[level](x=x, edge_index=edge_index, edge_weight=edge_weight) # Z n*d
+        level_convs = self.convs[level]
+        if self.agg_gnn == 'GCN':
+            for conv in level_convs[:-1]:
+                x = conv(x, edge_index, edge_weight)
+                x = F.relu(x)
+                x = F.dropout(x, p=self.drop_ratio, training=self.training)
+            x = level_convs[-1](x, edge_index, edge_weight)
         else:
-            embedding = self.convs[level](x=x, edge_index=edge_index) # Z n*d
-        to_next = F.relu(embedding)
-        
-        return embedding, to_next
+            for conv in level_convs[:-1]:
+                x = conv(x, edge_index)
+                x = F.relu(x)
+                x = F.dropout(x, p=self.drop_ratio, training=self.training)
+            x = level_convs[-1](x, edge_index)
+        return x
 
 
 class Adaptive_pooling(nn.Module):
-    def __init__(self, config, in_size, cluster_range, overlap, all_cluster, pooling_ratio):
+    def __init__(self, args, in_size, cluster_range):
         super(Adaptive_pooling, self).__init__()
-        self.config = config
+        self.args = args
         self.in_size = in_size
         self.cluster_range = cluster_range
-        self.overlap = overlap
-        self.all_cluster = all_cluster
-        self.pooling_ratio = pooling_ratio
-        
-        self.cluster_assignment = Cluster_assignment(self.cluster_range, 
-                                                     device=self.config['device'])
-        self.score_lin = nn.Linear(2*self.in_size, 1)
-        self.gat_att = nn.Linear(2*self.in_size, 1)
-        
-    def forward(self, embedding, edge_index, edge_matrix, edge_matrix_weight, edge_weight=None, batch=None):
-        # input: Z, A
-        # output: _Z, _A, B, cluster_ids, batch
-        N = embedding.size(0) # number of nodes
-        
-        # reconstruct graph where each edge's weight is the clossness between a pair of nodes
+        self.fitness_mode = args.fitness_mode
+        self.pooling_mode = args.pooling_mode
+        self.do_view = args.do_view
+        self.overlap = args.overlap
+        self.drop_ratio = args.drop_ratio
+        self.device = args.device
+
+        self.score_lin = nn.Linear(2 * self.in_size, 1)
+        self.pool_lin = nn.Linear(2 * self.in_size, 1)
+
+    def calculate_fitness(self, x, index, N, batch=None):
         # all values in [0, 1] and disgnal values are 1
-        # A
-        # normalize input embedding
-        Z = F.normalize(embedding, p=2, dim=-1)
-        connectivity_M = torch.mm(Z, Z.t())
-        
-        # structure loss
-        x_pair = self.score_lin(torch.cat((embedding[edge_index[0]], embedding[edge_index[1]]), dim=-1))
-        x_score = F.leaky_relu(x_pair)
-        x_score = tg.utils.softmax(x_score, edge_index[0], num_nodes=embedding.shape[0])
-        structure_M = tg.utils.to_dense_adj(edge_index=edge_index, edge_attr=x_score).squeeze(-1)[0]
-        
-        if self.config['fitness_mode']=='c':
-            fitness = connectivity_M
-        elif self.config['fitness_mode']=='s':
-            fitness = structure_M
-        elif self.config['fitness_mode']=='both_j':
-            fitness = connectivity_M + structure_M
-        elif self.config['fitness_mode']=='both_c':
-            fitness = connectivity_M * structure_M
-        
-        # set up clusters with lamda hops
-        # diagnal diagonal values are 0
-        cluster_matrices = Generate_clusters(matrix=edge_matrix, 
-                                             edge_score=fitness,
-                                             cluster_range=self.cluster_range,
-                                             threshold=self.config['edge_threshold']) # list of n*n
-        
-        # represent clusters within one matrix 
-        cluster_matrix = torch.stack(cluster_matrices, dim=0).sum(0)
-        cluster_matrix = (cluster_matrix > 0).float()
-        
-        # calculate the concentration of each cluster
-        # make sure isolated nodes with 0 scores, therefore no activation function after it
-        cluster_scores = self.cluster_assignment(fitness=fitness, 
-                                                 cluster_matrices=cluster_matrices) # list of n*1
-        
-        # select clusters
-        cluster_ids = Select_clusters(config=self.config, 
-                                      fitness=fitness, 
-                                      edge_matrix=edge_matrix,
-                                      cluster_matrix=cluster_matrix,
-                                      cluster_matrices=cluster_matrices,
-                                      cluster_scores=cluster_scores,
-                                      pooling_ratio=self.pooling_ratio,
-                                      cluster_range=self.cluster_range,
-                                      pick_all=self.all_cluster,
-                                      overlap=self.overlap)
-        
-        if self.config['do_view']:
-            # observe process
-            a = fill_diagonal(A=fitness, value=0, device=fitness.device)
-            f_min = a.min().data.cpu().numpy()[()]
-            f_max = a.max().data.cpu().numpy()[()]
-            c_min = cluster_scores.min().data.cpu().numpy()[()]
-            c_max = cluster_scores.max().data.cpu().numpy()[()]    
-            print(f'fitness min {f_min:.3f}, max {f_max:.3f}; '+
-                  f'cluster min {c_min:.3f}, max {c_max:.3f}')
-            f_mean = (a.sum()/torch.nonzero(a).size(0)).data.cpu().numpy()[()]
-            c_mean = cluster_scores.mean().data.cpu().numpy()[()]
-            b = cluster_scores[cluster_ids].clone()
-            s_mean = b.mean().data.cpu().numpy()[()]
-            print(f'fitness mean: {f_mean:.3f}, cluster mean: {c_mean:.3f}, selected cluster mean: {s_mean:.3f}')
-        
-        # maintaining graph connectivity
-        # S (assignment_matrix), B
-        S, _, S_w, S_w_orig, keeping_nodes, _S_ = Generate_assignment_matrix(cluster_matrix=cluster_matrix,
-                                                                        cluster_ids=cluster_ids,
-                                                                        fitness=fitness,
-                                                                        do_view=self.config['do_view'])
-        
-#         B = S.clone()
-        B = S_w.clone()
-        
-        # _X
-        if self.config['pooling_mode']=='mean': 
-            _embedding = torch.mm(S_w.t(), embedding)
-        elif self.config['pooling_mode']=='att':
-            # only available for non-overlapping case
-            # attention-1
+        if self.fitness_mode == 'c' or 'both' in self.fitness_mode:
+            # linear scores
+            x = F.normalize(x, p=2, dim=-1)
+            lin_score = torch.sum(x[index[0]] * x[index[1]], dim=-1)
+            lin_score = tg.utils.softmax(lin_score, index[0], num_nodes=N)
+        if self.fitness_mode == 's' or 'both' in self.fitness_mode:
+            # non-linear scores
+            x_score = self.score_lin(torch.cat((x[index[0]], x[index[1]]), dim=-1)).squeeze(-1)
+            x_score = F.leaky_relu(x_score)
+            nonlin_score = tg.utils.softmax(x_score, index[0], num_nodes=N)
+
+        if self.fitness_mode == 'both_c':
+            fitness = lin_score * nonlin_score
+            fitness = tg.utils.softmax(fitness, index[0], num_nodes=N)
+        elif self.fitness_mode == 'both_j':
+            fitness = lin_score + nonlin_score
+            fitness = tg.utils.softmax(fitness, index[0], num_nodes=N)
+        elif self.fitness_mode == 'c':
+            fitness = lin_score
+        elif self.fitness_mode == 's':
+            fitness = nonlin_score
+        return fitness
+
+    def Pool_nodes(self, x, ego_x, index_S, value_S, N):
+        if self.pooling_mode == 'mean':
+            # use fitness scores to pool nodes
+            x_j = x[index_S[0]]
+            _x = scatter(x_j, index_S[1], dim=0, reduce='mean')[index_S[1].unique()]
+        elif self.pooling_mode == 'max':
+            x_j = x[index_S[0]]
+            _x = scatter(x_j, index_S[1], dim=0, reduce='max')[index_S[1].unique()]
+        elif self.pooling_mode == 'main':
+            # adopt ego center node's feature as pooled node's feature
+            _x = ego_x.clone()
+        elif self.pooling_mode == 'att':
             # set up query and message
-            query_M = fill_diagonal(A=S_w_orig, value=1, device=S_w_orig.device)
-            if keeping_nodes.shape[0]>0:
-                query_M[:, list(set(range(N))-set(torch.cat((cluster_ids, keeping_nodes), dim=-1).tolist()))]=0 # reduced nodes have no components
-            else:
-                query_M[:, list(set(range(N))-set(cluster_ids.tolist()))]=0
-            pair = torch.nonzero(query_M>0).t()
-            x_pair = self.gat_att(torch.cat((embedding[pair[0]], embedding[pair[1]]), dim=-1))
-            x_score = F.leaky_relu(x_pair)
-#             x_score = tg.utils.softmax(x_score, pair[0], num_nodes=embedding.shape[0])
-            x_score = tg.utils.softmax(x_score, pair[1], num_nodes=embedding.shape[0])
-            cluster_weight = tg.utils.to_dense_adj(edge_index=pair, edge_attr=x_score).squeeze(-1)[0]
-            if cluster_weight.shape[0] < S_w.shape[0]:
-                cluster_weight = F.pad(input=cluster_weight, 
-                                       pad=(0, S_w.shape[0]-cluster_weight.shape[0], 0, S_w.shape[0]-cluster_weight.shape[0]), 
-                                       mode='constant', value=0)
-    
-            _embedding = torch.mm(S_w.t(), cluster_weight)
-            _embedding = torch.mm(_embedding, embedding)
-        elif self.config['pooling_mode']=='max':
-            _embedding = torch.mm(_S_.t(), embedding)
+            x_score = self.pool_lin(torch.cat((x[index_S[0]], ego_x[index_S[1]]), dim=-1)).squeeze(-1)
+            x_score = F.leaky_relu(x_score)
+            x_score = tg.utils.softmax(x_score, index_S[1], num_nodes=N)
+            # Sample attention coefficients stochastically
+            x_score = F.dropout(x_score, p=self.drop_ratio, training=self.training)
+            # learn pooled node features
+            x_j = x[index_S[0]] * x_score.unsqueeze(-1)
+            x_j = x_j * value_S.unsqueeze(-1)
+            _x = scatter(x_j, index_S[1], dim=0, reduce='add')[index_S[1].unique()]
+        return _x
 
-        # _A
-#         edge_matrix = fill_diagonal(A=edge_matrix, value=1, device=edge_matrix.device)
-        edge_matrix = fill_diagonal(A=edge_matrix_weight, value=1, device=edge_matrix.device)
-        _edge_matrix_weight = torch.mm(torch.mm(S.t(), edge_matrix), S)
-        
-        _edge_matrix = _edge_matrix_weight.clone()
-        _edge_matrix[_edge_matrix>0] = 1
-        
-        _edge_index, _edge_weight = tg.utils.dense_to_sparse(_edge_matrix_weight)
-        
-        return _embedding, _edge_matrix, _edge_matrix_weight, _edge_index, _edge_weight, B, cluster_ids, batch
+    def forward(self, embedding, edge_index, edge_weight):
+        N = embedding.size(0)  # number of nodes
 
-class AHGNN_LP(nn.Module):
-    def __init__(self, config, feat_dim):
-        super(AHGNN_LP, self).__init__()
-        self.config = config
+        # set up ego networks with lamda hops
+        cluster_index = Generate_clusters(
+            edge_index=edge_index,
+            num_hops=self.cluster_range
+        )
+        # calculate fitness scores each ego
+        fitness = self.calculate_fitness(
+            embedding, cluster_index, N
+        )
+        # calculate the concentration of each cluster
+        cluster_scores = Cluster_assignment(
+            fitness=fitness,
+            index=cluster_index
+        )
+
+        # if self.do_view:
+        #     print('Fitness min {:.3f}, max {:.3f}, mean {:.3f}'.format(
+        #         fitness.min().item(), fitness.max().item(), fitness.mean().item()
+        #     ))
+        #     print('Cluster score min {:.3f}, max {:.3f}, mean {:.3f}'.format(
+        #         cluster_scores.min().item(), cluster_scores.max().item(), cluster_scores.mean().item()
+        #     ))
+
+        # select clusters
+        cluster_ids = Select_clusters(
+            edge_index=edge_index,
+            scores=cluster_scores,
+            range=self.cluster_range,
+            overlap=self.overlap,
+            N=N,
+            device=self.device
+        )
+        _edge_index, _edge_weight, index_S, value_S, ego_x = graph_connectivity(
+            x=embedding,
+            cluster_ids=cluster_ids,
+            edge_index=edge_index,
+            edge_weight=edge_weight,
+            cluster_index=cluster_index,
+            score=fitness,
+            N=N,
+            do_view=self.do_view,
+            device=self.device
+        )
+        _embedding = self.Pool_nodes(
+            x=embedding, ego_x=ego_x,
+            index_S=index_S, value_S=value_S, N=N
+        )
+        return _embedding, _edge_index, _edge_weight, index_S, value_S, fitness
+
+
+class AdamGNN(nn.Module):
+    def __init__(self, args, feat_dim, out_dim):
+        super(AdamGNN, self).__init__()
+        self.args = args
         self.feat_dim = feat_dim
-        self.agg_gnn = config['local_agg_gnn']
-        self.hid_dim = config['hid_dim']
-        self.num_levels = config['num_levels']
-        self.output_mode = config['output_mode']
-        
-        self.encoder = Encoder(feat_dim=self.feat_dim,
-                               hid_dim=self.hid_dim,
-                               agg_gnn=self.agg_gnn,
-                               gat_head=self.config['gat_head'], 
-                               drop_out=self.config['drop_ratio'],
-                               num_levels=self.num_levels)
-        
-        self.pools = nn.ModuleList()
-        for idx in range(self.num_levels):
-            self.pools.append(Adaptive_pooling(config=self.config,
-                                               in_size=self.hid_dim,
-                                               cluster_range=self.config['cluster_range'],
-                                               overlap=self.config['overlap'],
-                                               all_cluster=self.config['all_cluster'],
-                                               pooling_ratio=self.config['pooling_ratio']))
-        
-        self.out_cat = Merge_xs(config=self.config,
-                                mode=self.output_mode, 
-                                dim=self.hid_dim,
-                                num_levels=self.num_levels)
-        
-        self.last_gnn = GCNConv(self.hid_dim, self.hid_dim)
-    
-    def forward(self, data, epoch_id):
-        x, edge_index, edge_M, batch = data.x, data.train_pos_edge_index, data.edge_matrix, data.batch
-        
-        if x.shape[0] > edge_index.max().item():
-            edge_index = torch.cat((edge_index, torch.Tensor([[data.x.shape[0]-1], 
-                                                              [data.x.shape[0]-1]]).long().to(edge_index.device)), dim=-1)
-        edge_M = tg.utils.to_dense_adj(edge_index)[0]
-        edge_M_weight = edge_M.clone()
-        edge_weight = edge_M_weight[edge_M_weight>0]
-        
-        orig_edge_index = edge_index
-        orig_edge_weight = edge_weight
-
-        generated_embeddings = []
-        recover_matrices = []
-        As = []
-        weighted_As = []
-
-        for level in range(self.num_levels):
-            # gnn embedding
-            embedding, to_next = self.encoder(x, level, edge_index, edge_weight)
-            if level==0:
-                embedding_gnn = embedding.clone()
-#                 p = self.orig_gnn(x=embedding, edge_index=edge_index, edge_weight=edge_weight)
-            
-            # _X, _A, _A_w, _edge_index, _edge_weight, B, cluster_ids, batch
-            _input, _edge_M, _edge_M_weight, _edge_index, _edge_weight, recover_M, cluster_ids, batch = self.pools[level](embedding=to_next,
-                                                                                                                          edge_index=edge_index,
-                                                                                                                          edge_matrix=edge_M,
-                                                                                                                          edge_matrix_weight=edge_M_weight,
-                                                                                                                          edge_weight=edge_weight,
-                                                                                                                          batch=batch)
-            
-            _input = F.normalize(_input, p=2, dim=1)
-
-            if level>0:
-                for idx, recover in enumerate(reversed(recover_matrices)):
-                    embedding = torch.mm(recover, embedding)
-                    
-            generated_embeddings.append(embedding)
-            recover_matrices.append(recover_M)
-            As.append(edge_M)
-            weighted_As.append(edge_M_weight)
-
-            # assign the embedding as next level's input feature matrix
-            x = _input
-            edge_M = _edge_M
-            edge_M_weight = _edge_M_weight
-            edge_weight = _edge_weight
-            edge_index = _edge_index
-            
-            # feature normalization
-            x = x / x.sum(1, keepdim=True).clamp(min=1)
-        
-        embedding, scores = self.out_cat(data=data, xs=generated_embeddings)
-        
-        loss_kl = kl_loss(mu=embedding, logvar=embedding_gnn)
-        
-        embedding = self.last_gnn(x=embedding, 
-                                  edge_index=orig_edge_index, 
-                                  edge_weight=orig_edge_weight)
-        
-#         out = embedding
-        out = F.normalize(embedding, p=2, dim=-1)
-        
-        return out, loss_kl, recover_matrices, scores
-
-class AHGNN_NC(nn.Module):
-    def __init__(self, config, feat_dim, out_dim):
-        super(AHGNN_NC, self).__init__()
-        self.config = config
-        self.feat_dim = feat_dim
-        self.agg_gnn = config['local_agg_gnn']
-        self.hid_dim = config['hid_dim']
+        self.agg_gnn = args.local_agg_gnn
+        self.hid_dim = args.hid_dim
+        self.drop_ratio = args.drop_ratio
         self.out_dim = out_dim
-        self.num_levels = config['num_levels']
-        self.output_mode = config['output_mode']
-        
-        self.encoder = Encoder(feat_dim=self.feat_dim,
-                               hid_dim=self.hid_dim,
-                               agg_gnn=self.agg_gnn,
-                               gat_head=self.config['gat_head'], 
-                               drop_out=self.config['drop_ratio'],
-                               num_levels=self.num_levels)
-        
+        self.num_levels = args.num_levels
+        self.cluster_range = args.cluster_range
+        self.encoder_layers = args.encoder_layers
+        self.output_mode = args.output_mode
+
+        # define encoder for each level
+        self.encoder = Encoder(
+            feat_dim=self.feat_dim, hid_dim=self.hid_dim,
+            agg_gnn=self.agg_gnn, drop_ratio=self.drop_ratio,
+            num_levels=self.num_levels, encoder_layers=self.encoder_layers
+        )
+        # define pools
         self.pools = nn.ModuleList()
-        for level in range(self.num_levels):
-            self.pools.append(Adaptive_pooling(config=self.config,
-                                               in_size=self.hid_dim,
-                                               cluster_range=self.config['cluster_range'],
-                                               overlap=self.config['overlap'],
-                                               all_cluster=self.config['all_cluster'],
-                                               pooling_ratio=self.config['pooling_ratio']))
-        
-        self.out_cat = Merge_xs(config=self.config,
-                                mode=self.output_mode, 
-                                dim=self.hid_dim,
-                                num_levels=self.num_levels)
-        
-        self.last_gnn = GCNConv(self.hid_dim, self.out_dim)
-    
-    def forward(self, data, epoch_id):
-        x, edge_index, edge_M, batch = data.x, data.edge_index, data.edge_matrix, data.batch
-        edge_M_weight = edge_M.clone()
-        edge_weight = edge_M_weight[edge_M_weight>0]
-        
+        for _ in range(self.num_levels - 1):
+            self.pools.append(Adaptive_pooling(
+                args=self.args, in_size=self.hid_dim, cluster_range=self.cluster_range
+            ))
+        # define flyback aggregate
+        self.out_cat = Merge_xs(
+            args=self.args, mode=self.output_mode,
+            dim=self.hid_dim, num_levels=self.num_levels
+        )
+        # define last layer to update node embedding with multi-grained semantics
+        self.last_layer = nn.Linear(self.hid_dim, self.out_dim)
+        # self.last_layer = nn.Sequential(nn.Linear(self.hid_dim, 32), nn.ReLU(),
+        #                     nn.Linear(32, self.out_dim))
+
+    def forward(self, data):
+        x, edge_index, edge_weight = data.x, data.edge_index, data.edge_weight
         orig_edge_index = edge_index
-        orig_edge_weight = edge_weight
 
         generated_embeddings = []
-        recover_matrices = []
-        As = []
-        weighted_As = []
-        fitness = []
+        index_Bs = []
+        value_Bs = []
+        ls_index = []
 
         for level in range(self.num_levels):
             # gnn embedding
-            embedding, to_next = self.encoder(x, level, edge_index, edge_weight)
-
-            if level==0:
+            print(f'Level {level} has {edge_index.shape[1]} edges.')
+            embedding = self.encoder(x, level, edge_index, edge_weight)
+            if level == 0:
                 embedding_gnn = embedding.clone()
-            
-            # _X, _A, _A_w, _edge_index, _edge_weight, B, cluster_ids, batch
-            _input, _edge_M, _edge_M_weight, _edge_index, _edge_weight, recover_M, cluster_ids, batch, fit = self.pools[level](embedding=to_next,
-                                                                                                                          edge_index=edge_index,
-                                                                                                                          edge_matrix=edge_M,
-                                                                                                                          edge_matrix_weight=edge_M_weight,
-                                                                                                                          edge_weight=edge_weight,
-                                                                                                                          batch=batch)
-            
-            _input = F.normalize(_input, p=2, dim=1)
+            if level < (self.num_levels - 1):
+                _input, _index, _weight, index_B, value_B, _ = self.pools[level](
+                    embedding=embedding,
+                    edge_index=edge_index,
+                    edge_weight=edge_weight
+                )
+                _input = F.normalize(_input, p=2, dim=1)
+                index_Bs.append(index_B)
+                value_Bs.append(value_B)
+                ls_index.append(_index.data.cpu().numpy())
 
-            if level>0:
-                for idx, recover in enumerate(reversed(recover_matrices)):
-                    embedding = torch.mm(recover, embedding)
-            
+                # assign the embedding as next level's input feature matrix
+                x = _input
+                edge_index = _index
+                edge_weight = _weight
+
+            if (level > 0) & (level < (self.num_levels - 1)):
+                for index, value in zip(reversed(index_Bs[:-1]), reversed(value_Bs[:-1])):
+                    print('learned embedding shape:{}, transform from {} to {}'.format(
+                        embedding.shape[0], index[1].max().item() + 1, index[0].max().item() + 1
+                    ))
+                    embedding = scatter(embedding[index[1]] * value.unsqueeze(-1), index[0], dim=0, reduce='mean')
+                    print('after, embedding shape: {}'.format(embedding.shape[0]))
+            if level == (self.num_levels - 1):
+                for index, value in zip(reversed(index_Bs), reversed(value_Bs)):
+                    print('learned embedding shape:{}, transform from {} to {}'.format(
+                        embedding.shape[0], index[1].max().item() + 1, index[0].max().item() + 1
+                    ))
+                    embedding = scatter(embedding[index[1]] * value.unsqueeze(-1), index[0], dim=0, reduce='mean')
+                    print('after, embedding shape: {}'.format(embedding.shape[0]))
             generated_embeddings.append(embedding)
-            recover_matrices.append(recover_M)
-            As.append(edge_M)
-            weighted_As.append(edge_M_weight)
-            fitness.append(fit)
 
-            # assign the embedding as next level's input feature matrix
-            x = _input
-            edge_M = _edge_M
-            edge_M_weight = _edge_M_weight
-            edge_weight = _edge_weight
-            edge_index = _edge_index
-            
-        embedding, scores = self.out_cat(data=data, xs=generated_embeddings)
-        
+        if len(generated_embeddings) > 1:
+            embedding, _ = self.out_cat(xs=generated_embeddings)
+
         loss_kl = kl_loss(mu=embedding, logvar=embedding_gnn)
         loss_recon = recon_loss(z=embedding, pos_edge_index=orig_edge_index)
-        
-        embedding = self.last_gnn(x=embedding, 
-                                  edge_index=orig_edge_index, 
-                                  edge_weight=orig_edge_weight)
-        
-        out = F.log_softmax(embedding, dim=1)
-        
-        return out, loss_recon, loss_kl, recover_matrices, scores, fitness
 
-class AHGNN_GC(nn.Module):
-    def __init__(self, config, feat_dim, out_dim):
-        super(AHGNN_GC, self).__init__()
-        self.config = config
-        self.feat_dim = feat_dim
-        self.agg_gnn = config['local_agg_gnn']
-        self.hid_dim = config['hid_dim']
-        self.out_dim = out_dim
-        self.num_levels = config['num_levels']
-        self.output_mode = config['output_mode']
-        
-        self.encoder = Encoder(feat_dim=self.feat_dim,
-                               hid_dim=self.hid_dim,
-                               agg_gnn=self.agg_gnn,
-                               gat_head=self.config['gat_head'], 
-                               drop_out=self.config['drop_ratio'],
-                               num_levels=self.num_levels)
-        
-        self.pools = nn.ModuleList()
-        for idx in range(self.num_levels):
-            self.pools.append(Adaptive_pooling(config=self.config,
-                                               in_size=self.hid_dim,
-                                               cluster_range=self.config['cluster_range'],
-                                               overlap=self.config['overlap'],
-                                               all_cluster=self.config['all_cluster'],
-                                               pooling_ratio=self.config['pooling_ratio']))
-        
-        self.out_cat = Merge_xs(config=self.config,
-                                mode=self.output_mode, 
-                                dim=self.hid_dim,
-                                num_levels=self.num_levels)
-        
-        self.last_gnn = GCNConv(self.hid_dim, self.hid_dim)
-        
-        self.lin1 = torch.nn.Linear(2*self.hid_dim, self.hid_dim)
-        self.lin2 = torch.nn.Linear(self.hid_dim, self.hid_dim//2)
-        self.lin3 = torch.nn.Linear(self.hid_dim//2, self.out_dim)
-    
-    def forward(self, data, epoch_id):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-        if x is None:
-            x = torch.zeros(edge_index.max().item()+1, 128).to(edge_index.device)
-        data.x = x
-        
-        if x.shape[0] > edge_index.max().item():
-            edge_index = torch.cat((data.edge_index, torch.Tensor([[data.x.shape[0]-1], 
-                                                                   [data.x.shape[0]-1]]).long().to(edge_index.device)), dim=-1)
-        
-        edge_M = tg.utils.to_dense_adj(edge_index)[0]
-        edge_M_weight = edge_M.clone()
-        edge_weight = edge_M_weight[edge_M_weight>0]
-        
-        orig_edge_index = edge_index
-        orig_edge_weight = edge_weight
+        embedding = self.last_layer(embedding)
 
-        generated_embeddings = []
-        recover_matrices = []
-        As = []
-        weighted_As = []
-
-        for level in range(self.num_levels):
-            # gnn embedding
-            embedding, to_next = self.encoder(x, level, edge_index, edge_weight)
-            if level==0:
-                embedding_gnn = embedding.clone()
-#                 p = self.orig_gnn(x=embedding, edge_index=edge_index, edge_weight=edge_weight)
-                x1 = torch.cat([gmp(embedding_gnn, batch), gap(embedding_gnn, batch)], dim=1)
-            
-            # _X, _A, _A_w, _edge_index, _edge_weight, B, cluster_ids, batch
-            _input, _edge_M, _edge_M_weight, _edge_index, _edge_weight, recover_M, cluster_ids, batch = self.pools[level](embedding=to_next,
-                                                                                                                          edge_index=edge_index,
-                                                                                                                          edge_matrix=edge_M,
-                                                                                                                          edge_matrix_weight=edge_M_weight,
-                                                                                                                          edge_weight=edge_weight,
-                                                                                                                          batch=batch)
-            
-            _input = F.normalize(_input, p=2, dim=1)
-
-            if level>0:
-                for idx, recover in enumerate(reversed(recover_matrices)):
-                    embedding = torch.mm(recover, embedding)
-
-            generated_embeddings.append(embedding)
-            recover_matrices.append(recover_M)
-            As.append(edge_M)
-            weighted_As.append(edge_M_weight)
-
-            # assign the embedding as next level's input feature matrix
-            x = _input
-            edge_M = _edge_M
-            edge_M_weight = _edge_M_weight
-            edge_weight = _edge_weight
-            edge_index = _edge_index
-        
-#         embedding, scores = self.out_cat(data=data, xs=generated_embeddings)
-#         x2 = torch.cat([gmp(embedding, batch), gap(embedding, batch)], dim=1)
-        
-#         loss_kl = kl_loss(mu=embedding, logvar=embedding_gnn)
-#         loss_recon = recon_loss(z=embedding, pos_edge_index=orig_edge_index)
-        
-        embedding = self.last_gnn(x=embedding, 
-                                  edge_index=orig_edge_index, 
-                                  edge_weight=orig_edge_weight)
-        x3 = torch.cat([gmp(embedding, batch), gap(embedding, batch)], dim=1)
-        
-#         x = F.relu(x1) + F.relu(x2) + F.relu(x3)
-        x = F.relu(x1) + F.relu(x3)
-        x = F.relu(self.lin1(x))
-        x = F.dropout(x, p=self.config['drop_ratio'], training=self.training)
-        x = F.relu(self.lin2(x))
-        x = F.dropout(x, p=self.config['drop_ratio'], training=self.training)
-        
-        out = F.log_softmax(x, dim=1)
-        
-#         return out, loss_recon, loss_kl, recover_matrices, scores
-        return out, torch.Tensor([0]).to(device), torch.Tensor([0]).to(device), torch.Tensor([0]).to(device), torch.Tensor([0]).to(device)
+        return embedding, loss_recon, loss_kl, (index_Bs, value_Bs), ls_index
