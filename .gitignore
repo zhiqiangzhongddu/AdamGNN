@@ -1,8 +1,4 @@
 .idea
-data
-input
-reference_code
 code/checkpoints
 code/__pycache__
 code/.ipynb_checkpoints
-output/
