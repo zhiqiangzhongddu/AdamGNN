@@ -14,10 +14,11 @@ def set_up_NC_training(data, num_train, seed):
     random.seed(seed)
     np.random.seed(seed)
 
-    if data.num_nodes < 2000:
+    if num_train != 20:
         if num_train < 10:
             '''
-            specific for KarateClub dataset
+            few-shot settings
+            In this case, num_train is number of training instances, instead of train ratio. 
             '''
             train_nodes = np.empty(0, dtype=int)
             val_nodes = np.empty(0, dtype=int)
@@ -28,44 +29,31 @@ def set_up_NC_training(data, num_train, seed):
                 train_nodes = np.append(train_nodes, select_train)
                 val_nodes = np.append(val_nodes, select_val)
             test_nodes = np.array(list(set(range(data.num_nodes)) - set(train_nodes) - set(val_nodes)))
-        elif num_train != 20:
-            non_train_nodes = random.sample(list(range(data.num_nodes)), int(data.num_nodes * ((1 - num_train / 100))))
+        else:
+            non_train_nodes = random.sample(
+                list(range(data.num_nodes)), int(data.num_nodes * ((1 - num_train / 100)))
+            )
             train_nodes = np.array(list(set(range(data.num_nodes)) - set(non_train_nodes)))
             val_nodes = np.array(non_train_nodes[:int(data.num_nodes * ((1 - num_train / 100)) / 2)])
             test_nodes = np.array(non_train_nodes[int(data.num_nodes * ((1 - num_train / 100)) / 2):])
-    else:
-        if num_train != 20:
-            if num_train > 50:
-                non_train_nodes = random.sample(list(range(data.num_nodes)),
-                                                int(data.num_nodes * ((1 - num_train / 100))))
-                train_nodes = np.array(list(set(range(data.num_nodes)) - set(non_train_nodes)))
-                val_nodes = np.array(non_train_nodes[:int(data.num_nodes * ((1 - num_train / 100)) / 2)])
-                test_nodes = np.array(non_train_nodes[int(data.num_nodes * ((1 - num_train / 100)) / 2):])
 
-            else:
-                non_train_nodes = random.sample(list(range(data.num_nodes)),
-                                                int(data.num_nodes * ((1 - num_train / 100))))
-                train_nodes = np.array(list(set(range(data.num_nodes)) - set(non_train_nodes)))
-                val_nodes = np.array(random.sample(set(range(data.num_nodes)) - set(train_nodes), 500))
-                test_nodes = np.array(
-                    random.sample(set(range(data.num_nodes)) - set(train_nodes) - set(val_nodes), 1000))
+        train_mask = np.array([False] * data.num_nodes)
+        val_mask = np.array([False] * data.num_nodes)
+        test_mask = np.array([False] * data.num_nodes)
+        train_mask[train_nodes] = True
+        val_mask[val_nodes] = True
+        test_mask[test_nodes] = True
 
-    train_mask = np.array([False] * data.num_nodes)
-    val_mask = np.array([False] * data.num_nodes)
-    test_mask = np.array([False] * data.num_nodes)
-    train_mask[train_nodes] = True
-    val_mask[val_nodes] = True
-    test_mask[test_nodes] = True
-
-    data.train_mask = torch.Tensor(train_mask).bool()
-    data.val_mask = torch.Tensor(val_mask).bool()
-    data.test_mask = torch.Tensor(test_mask).bool()
+        data.train_mask = torch.Tensor(train_mask).bool()
+        data.val_mask = torch.Tensor(val_mask).bool()
+        data.test_mask = torch.Tensor(test_mask).bool()
 
     print('Train: {} valid: {} test: {}'.format(
         data.train_mask.sum().numpy().tolist(),
         data.val_mask.sum().numpy().tolist(),
         data.test_mask.sum().numpy().tolist()
     ))
+
     return data
 
 
