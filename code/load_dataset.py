@@ -88,6 +88,12 @@ def get_NC_dataset(dataset_name, use_features, seed):
         if not use_features:
             feature = np.identity(data.num_nodes)
             data.x = torch.FloatTensor(feature)
+        train_nodes = np.empty(0, dtype=int)
+        for label in data.y.unique():
+            index = torch.nonzero(data.y == label).view(-1)
+            train_nodes = np.append(train_nodes, np.array(random.sample(index.data.numpy().tolist(), 20)))
+        val_nodes = np.array(random.sample(set(range(data.num_nodes)) - set(train_nodes), 500))
+        test_nodes = np.array(random.sample(set(range(data.num_nodes)) - set(train_nodes) - set(val_nodes), 1000))
 
     elif dataset_name == 'citeseer':
         print('is reading {} dataset...'.format(dataset_name))
@@ -97,6 +103,12 @@ def get_NC_dataset(dataset_name, use_features, seed):
         if not use_features:
             feature = np.identity(data.num_nodes)
             data.x = torch.FloatTensor(feature)
+        train_nodes = np.empty(0, dtype=int)
+        for label in data.y.unique():
+            index = torch.nonzero(data.y == label).view(-1)
+            train_nodes = np.append(train_nodes, np.array(random.sample(index.data.numpy().tolist(), 20)))
+        val_nodes = np.array(random.sample(set(range(data.num_nodes)) - set(train_nodes), 500))
+        test_nodes = np.array(random.sample(set(range(data.num_nodes)) - set(train_nodes) - set(val_nodes), 1000))
 
     elif dataset_name == 'pubmed':
         print('is reading {} dataset...'.format(dataset_name))
@@ -106,6 +118,12 @@ def get_NC_dataset(dataset_name, use_features, seed):
         if not use_features:
             feature = np.identity(data.num_nodes)
             data.x = torch.FloatTensor(feature)
+        train_nodes = np.empty(0, dtype=int)
+        for label in data.y.unique():
+            index = torch.nonzero(data.y == label).view(-1)
+            train_nodes = np.append(train_nodes, np.array(random.sample(index.data.numpy().tolist(), 20)))
+        val_nodes = np.array(random.sample(set(range(data.num_nodes)) - set(train_nodes), 500))
+        test_nodes = np.array(random.sample(set(range(data.num_nodes)) - set(train_nodes) - set(val_nodes), 1000))
 
     elif dataset_name == 'cs':
         print('is reading {} dataset...'.format(dataset_name))
@@ -319,20 +337,16 @@ def get_NC_dataset(dataset_name, use_features, seed):
         val_nodes = np.array(non_train_nodes[:int(data.num_nodes * ((1 - 20 / 100)) / 2)])
         test_nodes = np.array(non_train_nodes[int(data.num_nodes * ((1 - 20 / 100)) / 2):])
 
-    if dataset_name not in ['cora', 'citeseer', 'pubmed']:
-        train_mask = np.array([False] * data.num_nodes)
-        val_mask = np.array([False] * data.num_nodes)
-        test_mask = np.array([False] * data.num_nodes)
-        train_mask[train_nodes] = True
-        val_mask[val_nodes] = True
-        test_mask[test_nodes] = True
+    train_mask = np.array([False] * data.num_nodes)
+    val_mask = np.array([False] * data.num_nodes)
+    test_mask = np.array([False] * data.num_nodes)
+    train_mask[train_nodes] = True
+    val_mask[val_nodes] = True
+    test_mask[test_nodes] = True
 
-        data.train_mask = torch.BoolTensor(train_mask)
-        data.val_mask = torch.BoolTensor(val_mask)
-        data.test_mask = torch.BoolTensor(test_mask)
-    # if tg.utils.contains_isolated_nodes(data.edge_index):
-    #     data.edge_index = tg.utils.remove_isolated_nodes(data.edge_index, num_nodes=data.num_nodes)[0]
-    #     data.x = data.x[data.edge_index.unique()]
+    data.train_mask = torch.BoolTensor(train_mask)
+    data.val_mask = torch.BoolTensor(val_mask)
+    data.test_mask = torch.BoolTensor(test_mask)
 
     return data
 
