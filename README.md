@@ -17,3 +17,16 @@ All eight datasets we used in the paper are all public datasets which can be dow
 
 ### Code execution
 Two demo file is given to show the execution of link prediction (LP) and node classification (NC) tasks.
+
+## Citation
+
+Please cite our paper if you make use of this code in your own work:
+
+```bibtex
+@article{ZLP221,
+author = {Zhiqiang Zhong and Cheng{-}Te Li and Jun Pang},
+title = {Multi-grained Semantics-aware Graph Neural Networks},
+journal = {IEEE Transactions on Knowledge and Data Engineering (TKDE)},
+year = {2022},
+}
+```
