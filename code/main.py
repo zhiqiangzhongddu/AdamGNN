@@ -28,6 +28,8 @@ parser.add_argument('--model', dest='model', default='GCN', type=str,
                     help='model class name. E.g., GCN, PGNN, HCGNN...')
 parser.add_argument('--local_agg_gnn', dest='local_agg_gnn', default='GCN', type=str,
                     help='GNN model used for primary node generation')
+parser.add_argument('--encoder_layers', dest='encoder_layers', default=1, type=int,
+                    help='number of GNN encoder layers.')
 parser.add_argument('--fitness_mode', dest='fitness_mode', default='both_c', type=str,
                     help='how do we jointly use two fitness scores. E.g., c: \phi_c s: \phi_s both_j both_c')
 parser.add_argument('--pooling_mode', dest='pooling_mode', default='att', type=str,
